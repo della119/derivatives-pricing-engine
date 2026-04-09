@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Build artifacts (PyInstaller / Nuitka)
+dist/
+build/
+nuitka_compiled/
+*.spec.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Streamlit local config (keep .streamlit/config.toml if present)
+.streamlit/secrets.toml
