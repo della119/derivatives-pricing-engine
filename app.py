@@ -25,7 +25,7 @@ from product_registry import (
 # Page config
 # =====================================================================
 st.set_page_config(
-    page_title="Derivatives Pricing Engine",
+    page_title="Derivatives Pricing Engine by Della 😊",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -442,7 +442,7 @@ def build_greek_surface(func, base_kwargs, product, x_key, y_key,
 # =====================================================================
 # Sidebar: product selection
 # =====================================================================
-st.sidebar.markdown("## 📈 Derivatives Pricing Engine")
+st.sidebar.markdown("## 📈 Derivatives Pricing Engine by Della 😊")
 st.sidebar.markdown("---")
 
 products_by_cat = get_products_by_category()
