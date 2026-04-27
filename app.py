@@ -20,6 +20,7 @@ if ROOT not in sys.path:
 from product_registry import (
     PRODUCTS, CATEGORIES, get_products_by_category, get_category_name,
 )
+from risk_metrics import compute_all_var_methods
 
 # =====================================================================
 # Page config
@@ -514,10 +515,11 @@ st.markdown(f'<div class="main-header">{product["name"]}</div>', unsafe_allow_ht
 st.markdown(f"*{product['desc']}*")
 
 # Tabs
-tab_pricing, tab_analysis, tab_greeks = st.tabs([
+tab_pricing, tab_analysis, tab_greeks, tab_risk = st.tabs([
     "💰 Pricing Calculator",
     "📖 Product Analysis",
     "📊 Greeks & Sensitivity",
+    "📉 Value at Risk",
 ])
 
 
@@ -957,3 +959,334 @@ with tab_greeks:
                         st.warning("Could not generate surface for selected parameters.")
         else:
             st.info("Not enough parameters for a 3D surface plot.")
+
+
+# =====================================================================
+# TAB 4: Value at Risk
+# =====================================================================
+with tab_risk:
+    _v_snap = st.session_state.get(result_key)
+    if not _v_snap:
+        st.info("Run a valuation first to compute VaR.")
+        st.stop()
+
+    is_mc_product = product.get("returns_dict", False)
+    if is_mc_product:
+        st.warning(
+            "VaR via full revaluation is not available for Monte Carlo products "
+            "(stochastic noise compounds across scenarios). Use an analytical model."
+        )
+        st.stop()
+
+    _v_params = _v_snap["param_values"]
+    _v_ot = _v_snap["option_type"]
+    _v_ec = _v_snap["extra_choice_values"]
+    _v_ep = _v_snap["extra_param_values"]
+
+    # Detect parameter keys (reuse logic from Greeks tab)
+    S_key_v = "S"
+    for k in ("S", "F", "S_f", "F1", "S1"):
+        if k in _v_params:
+            S_key_v = k
+            break
+    sigma_key_v = "sigma"
+    for k in ("sigma", "sigma_S", "sigma1", "sigma_swap", "sigma_abs"):
+        if k in _v_params:
+            sigma_key_v = k
+            break
+    T_key_v = "T"
+    for k in ("T", "T_expiry"):
+        if k in _v_params:
+            T_key_v = k
+            break
+
+    # Check we have what we need
+    if S_key_v not in _v_params or sigma_key_v not in _v_params or T_key_v not in _v_params:
+        st.warning(
+            "VaR requires Spot, Volatility, and Time-to-Expiry parameters. "
+            "This product does not expose all three."
+        )
+        st.stop()
+
+    spot_v = float(_v_params[S_key_v])
+    sigma_v = float(_v_params[sigma_key_v])
+    T_v = float(_v_params[T_key_v])
+
+    st.markdown('<div class="section-header">VaR Configuration</div>', unsafe_allow_html=True)
+
+    var_c1, var_c2, var_c3, var_c4 = st.columns(4)
+    with var_c1:
+        position_size = st.number_input(
+            "Position Size (contracts)", min_value=1.0, max_value=1e7,
+            value=100.0, step=10.0, key="var_pos_size",
+            help="Number of option contracts held",
+        )
+    with var_c2:
+        confidence_pct = st.selectbox(
+            "Confidence Level", [90.0, 95.0, 99.0, 99.5],
+            index=1, key="var_conf",
+            help="Probability that loss will NOT exceed VaR",
+        )
+    with var_c3:
+        # Cap horizon at 80% of remaining time-to-expiry to keep MC stable
+        max_horizon_days = max(1.0, T_v * 252 * 0.8)
+        horizon_days = st.number_input(
+            "Horizon (days)", min_value=1.0, max_value=float(max_horizon_days),
+            value=min(1.0, max_horizon_days), step=1.0, key="var_horizon",
+            help="Holding period over which loss is measured",
+        )
+    with var_c4:
+        long_position = st.radio(
+            "Position Direction", ["Long", "Short"],
+            index=0, horizontal=True, key="var_long",
+        )
+        is_long = (long_position == "Long")
+
+    var_c5, var_c6, var_c7 = st.columns(3)
+    with var_c5:
+        mu_annual = st.number_input(
+            "Drift (μ, annual %)", min_value=-50.0, max_value=50.0,
+            value=0.0, step=0.5, key="var_mu",
+            help="Expected return on underlying (0 = risk-neutral)",
+        ) / 100.0
+    with var_c6:
+        n_mc_paths = st.selectbox(
+            "MC Paths", [1000, 2500, 5000, 10000, 25000],
+            index=2, key="var_mc_paths",
+            help="More paths = more accurate but slower",
+        )
+    with var_c7:
+        use_historical = st.checkbox(
+            "Use Historical Returns", value=False, key="var_use_hist",
+            help="Use empirical return distribution instead of normal",
+        )
+
+    historical_returns_arr = None
+    if use_historical:
+        st.markdown("**Historical Daily Log Returns**")
+        hist_text = st.text_area(
+            "Enter daily log returns, one per line (or comma-separated)",
+            value="",
+            height=100,
+            key="var_hist_returns",
+            help="e.g., -0.012, 0.008, 0.005, -0.020, ... (typical equity index moves)",
+        )
+        if hist_text.strip():
+            try:
+                # Accept comma- or newline-separated values
+                cleaned = hist_text.replace("\n", ",").replace(" ", "")
+                historical_returns_arr = np.array(
+                    [float(x) for x in cleaned.split(",") if x.strip()],
+                    dtype=float,
+                )
+                st.caption(f"Loaded {len(historical_returns_arr)} historical returns.")
+            except ValueError:
+                st.error("Could not parse historical returns. Use numbers separated by commas/newlines.")
+                historical_returns_arr = None
+
+    run_var = st.button(
+        "▶  Compute VaR", key="run_var", type="primary", use_container_width=True,
+    )
+
+    if run_var:
+        # Build the pricer kwargs
+        int_keys = {"N", "N_S", "N_T", "n", "n_paths", "n_steps", "n_terms"}
+        var_func_kwargs = dict(_v_params)
+        if _v_ot:
+            var_func_kwargs["option_type"] = _v_ot
+        var_func_kwargs.update(_v_ec)
+        var_func_kwargs.update(_v_ep)
+        for k in int_keys:
+            if k in var_func_kwargs:
+                var_func_kwargs[k] = int(var_func_kwargs[k])
+
+        var_func = load_func(product["module"], product["func"])
+
+        # Wrapper that fixes option_type and extras
+        def var_pricer(**kw):
+            full_kw = dict(kw)
+            return var_func(**full_kw)
+
+        # Get current price + Greeks for delta-normal
+        with st.spinner("Computing VaR (Delta-Normal, Delta-Gamma, Monte Carlo)..."):
+            base_price, _ = safe_price(var_func, var_func_kwargs)
+            if base_price is None:
+                st.error("Could not compute base option value.")
+                st.stop()
+
+            # Get Greeks (reuse the helper)
+            def greek_pricer_var(**kw):
+                full_kw = dict(kw)
+                if _v_ot:
+                    full_kw["option_type"] = _v_ot
+                full_kw.update(_v_ec)
+                full_kw.update(_v_ep)
+                for k in int_keys:
+                    if k in full_kw:
+                        full_kw[k] = int(full_kw[k])
+                return var_func(**full_kw)
+
+            greeks_v, _ = compute_numerical_greeks(
+                greek_pricer_var, _v_params,
+                S_key=S_key_v, sigma_key=sigma_key_v, T_key=T_key_v,
+            )
+            delta_v = greeks_v.get("Delta", 0.0)
+            gamma_v = greeks_v.get("Gamma", 0.0)
+
+            # Run all VaR methods
+            results = compute_all_var_methods(
+                pricer=var_pricer,
+                base_kwargs=var_func_kwargs,
+                option_value=base_price,
+                delta=delta_v,
+                gamma=gamma_v,
+                spot=spot_v,
+                sigma_annual=sigma_v,
+                mu_annual=mu_annual,
+                horizon_days=horizon_days,
+                confidence=confidence_pct / 100.0,
+                position_size=position_size,
+                long=is_long,
+                spot_key=S_key_v,
+                T_key=T_key_v,
+                n_mc_paths=int(n_mc_paths),
+                historical_returns=historical_returns_arr,
+            )
+
+        # ---- Display results ----
+        st.markdown('<div class="section-header">VaR Results</div>', unsafe_allow_html=True)
+
+        # Position summary
+        pos_value = base_price * position_size * (1 if is_long else -1)
+        st.markdown(
+            f"<div class='info-box'>"
+            f"<b>Position:</b> {long_position} {position_size:,.0f} contracts &nbsp;|&nbsp; "
+            f"<b>Unit Price:</b> {base_price:.4f} &nbsp;|&nbsp; "
+            f"<b>Position Value:</b> {pos_value:,.2f}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Metric cards for each method
+        method_keys = [
+            ("delta_normal", "Delta-Normal", "metric-card"),
+            ("delta_gamma", "Delta-Gamma", "metric-card-blue"),
+            ("monte_carlo", "Monte Carlo", "metric-card-green"),
+        ]
+        if "historical" in results:
+            method_keys.append(("historical", "Historical", "metric-card-red"))
+
+        cols_var = st.columns(len(method_keys))
+        for i, (mk, mname, css) in enumerate(method_keys):
+            r = results[mk]
+            with cols_var[i]:
+                if "error" in r:
+                    st.markdown(f"""
+                    <div class="metric-card">
+                        <h3>{mname}</h3>
+                        <div class="value" style="font-size:0.9rem">Error</div>
+                    </div>""", unsafe_allow_html=True)
+                    st.caption(f"⚠ {r['error']}")
+                else:
+                    st.markdown(f"""
+                    <div class="metric-card {css}">
+                        <h3>{mname} VaR ({confidence_pct:.0f}%)</h3>
+                        <div class="value">{r['VaR']:,.2f}</div>
+                    </div>""", unsafe_allow_html=True)
+                    st.caption(f"ES: {r['ES']:,.2f} &nbsp;|&nbsp; n={r['n_scenarios']:,}")
+
+        st.markdown("")
+
+        # Comparison table
+        with st.expander("📋 Method Comparison Table", expanded=True):
+            import pandas as pd
+            rows = []
+            for mk, mname, _ in method_keys:
+                r = results[mk]
+                if "error" in r:
+                    rows.append([mname, "—", "—", "—", r["error"]])
+                else:
+                    rows.append([
+                        mname,
+                        f"{r['VaR']:,.2f}",
+                        f"{r['ES']:,.2f}",
+                        f"{r['n_scenarios']:,}",
+                        "OK",
+                    ])
+            df = pd.DataFrame(
+                rows, columns=["Method", f"VaR ({confidence_pct:.0f}%)", "ES (CVaR)", "Scenarios", "Status"]
+            )
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # P&L Distribution chart
+        st.markdown('<div class="section-header">P&L Distribution</div>', unsafe_allow_html=True)
+
+        fig_var = go.Figure()
+        colors_map = {
+            "delta_normal": "#7f8c8d",
+            "delta_gamma": "#3498db",
+            "monte_carlo": "#27ae60",
+            "historical":  "#e74c3c",
+        }
+        for mk, mname, _ in method_keys:
+            r = results[mk]
+            if "error" in r:
+                continue
+            pnl = r["pnl_dist"]
+            if pnl is None or len(pnl) == 0:
+                continue
+            fig_var.add_trace(go.Histogram(
+                x=pnl,
+                name=mname,
+                opacity=0.55,
+                nbinsx=60,
+                marker_color=colors_map.get(mk, "#888"),
+            ))
+            # VaR threshold line
+            fig_var.add_vline(
+                x=-r["VaR"],
+                line_dash="dash",
+                line_color=colors_map.get(mk, "#888"),
+                annotation_text=f"{mname} VaR",
+                annotation_position="top",
+            )
+
+        fig_var.update_layout(
+            barmode="overlay",
+            title=f"P&L Distribution at {horizon_days:.0f}-day horizon — Loss to the LEFT of dashed lines",
+            xaxis_title="P&L (gain →, loss ←)",
+            yaxis_title="Frequency",
+            height=440,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=50, r=30, t=70, b=50),
+        )
+        # Vertical line at 0 (no change)
+        fig_var.add_vline(x=0, line_color="black", line_width=1)
+        st.plotly_chart(fig_var, use_container_width=True)
+
+        # Methodology
+        with st.expander("📖 Methodology"):
+            st.markdown("""
+**Value-at-Risk (VaR)** estimates the maximum loss over a holding period at a given confidence level.
+
+**Methods compared:**
+
+- **Delta-Normal** — Parametric. Assumes P&L ≈ Δ·ΔS where ΔS is normal. Closed-form, fast.
+  - ✅ Pros: Instant, no simulation
+  - ❌ Cons: Ignores convexity (gamma), normality breaks for large moves
+
+- **Delta-Gamma** — Adds the second-order term: P&L ≈ Δ·ΔS + ½Γ·(ΔS)². Captures option convexity.
+  - ✅ Pros: Better for options near ATM with high gamma
+  - ❌ Cons: Still relies on normal underlying
+
+- **Monte Carlo** — Simulates underlying paths under GBM (or specified drift) and **fully reprices** the option at each scenario.
+  - ✅ Pros: Most accurate, handles all non-linearities
+  - ❌ Cons: Slowest; sensitive to GBM assumption
+
+- **Historical Simulation** — Uses empirical return distribution; reprices at each historical scenario.
+  - ✅ Pros: Captures real fat tails, no distribution assumption
+  - ❌ Cons: Limited by sample size; assumes past = future
+
+**Expected Shortfall (ES / CVaR)** is the average loss in scenarios worse than VaR — a coherent risk measure.
+""")
