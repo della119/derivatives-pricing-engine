@@ -20,7 +20,8 @@ if ROOT not in sys.path:
 from product_registry import (
     PRODUCTS, CATEGORIES, get_products_by_category, get_category_name,
 )
-from risk_metrics import compute_all_var_methods
+from risk_metrics import compute_all_var_methods, compute_cva_for_option, CreditCurve
+from mass_production import get_template_bytes, process_uploaded_workbook
 
 # =====================================================================
 # Page config
@@ -480,6 +481,67 @@ else:
 
 st.sidebar.markdown("---")
 
+# ──────────────────────────────────────────────────────────────────
+# Mass Production (batch valuation via Excel template)
+# ──────────────────────────────────────────────────────────────────
+st.sidebar.markdown("### 🏭 Mass Production")
+st.sidebar.caption("Batch-price multiple trades from an Excel template.")
+
+with st.sidebar.expander("How it works", expanded=False):
+    st.markdown(
+        "1. **Download** the template below.\n"
+        "2. Open it — fill rows in the **Valuation Input** sheet.\n"
+        "3. Use **Product Reference** sheet to find Product Keys.\n"
+        "4. **Upload** the filled file. Results download automatically."
+    )
+
+# Download template (cached so we don't rebuild on every rerun)
+@st.cache_data(show_spinner=False)
+def _cached_template_bytes() -> bytes:
+    return get_template_bytes()
+
+st.sidebar.download_button(
+    label="📥 Download Template",
+    data=_cached_template_bytes(),
+    file_name="Pricing_Engine_Batch_Template.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    use_container_width=True,
+    key="mp_template_download",
+)
+
+uploaded = st.sidebar.file_uploader(
+    "📤 Upload Filled Template",
+    type=["xlsx"],
+    key="mp_uploader",
+    help="Must contain a 'Valuation Input' sheet matching the template format.",
+)
+
+if uploaded is not None:
+    if st.sidebar.button("▶ Run Batch Valuation", key="mp_run", use_container_width=True, type="primary"):
+        with st.spinner("Processing batch — pricing each trade..."):
+            try:
+                results_bytes, summary = process_uploaded_workbook(uploaded.getvalue())
+                st.session_state["_mp_results"] = results_bytes
+                st.session_state["_mp_summary"] = summary
+                st.sidebar.success(
+                    f"Done! ✅ {summary['ok']} OK · ❌ {summary['errors']} errors · ⏭ {summary['skipped']} skipped"
+                )
+            except Exception as e:
+                st.sidebar.error(f"Batch failed: {e}")
+
+# Show download button once results are ready
+if "_mp_results" in st.session_state:
+    st.sidebar.download_button(
+        label="📊 Download Results",
+        data=st.session_state["_mp_results"],
+        file_name="Pricing_Engine_Batch_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="mp_results_download",
+    )
+
+st.sidebar.markdown("---")
+
 # Methodology Handbook download
 _handbook_path = os.path.join(ROOT, "期权定价公式完全指南_产品汇总分析.docx")
 if os.path.isfile(_handbook_path):
@@ -515,11 +577,12 @@ st.markdown(f'<div class="main-header">{product["name"]}</div>', unsafe_allow_ht
 st.markdown(f"*{product['desc']}*")
 
 # Tabs
-tab_pricing, tab_analysis, tab_greeks, tab_risk = st.tabs([
+tab_pricing, tab_analysis, tab_greeks, tab_risk, tab_cva = st.tabs([
     "💰 Pricing Calculator",
     "📖 Product Analysis",
     "📊 Greeks & Sensitivity",
     "📉 Value at Risk",
+    "🏦 Counterparty Risk (CVA)",
 ])
 
 
@@ -1289,4 +1352,292 @@ with tab_risk:
   - ❌ Cons: Limited by sample size; assumes past = future
 
 **Expected Shortfall (ES / CVaR)** is the average loss in scenarios worse than VaR — a coherent risk measure.
+""")
+
+
+# =====================================================================
+# TAB 5: Counterparty Risk (CVA / DVA / BCVA)
+# =====================================================================
+with tab_cva:
+    _c_snap = st.session_state.get(result_key)
+    if not _c_snap:
+        st.info("Run a valuation first to compute CVA.")
+        st.stop()
+
+    is_mc_product = product.get("returns_dict", False)
+    if is_mc_product:
+        st.warning(
+            "CVA via full revaluation is not available for Monte Carlo products."
+        )
+        st.stop()
+
+    _c_params = _c_snap["param_values"]
+    _c_ot = _c_snap["option_type"]
+    _c_ec = _c_snap["extra_choice_values"]
+    _c_ep = _c_snap["extra_param_values"]
+
+    # Detect parameter keys
+    S_key_c = "S"
+    for k in ("S", "F", "S_f", "F1", "S1"):
+        if k in _c_params:
+            S_key_c = k
+            break
+    sigma_key_c = "sigma"
+    for k in ("sigma", "sigma_S", "sigma1", "sigma_swap", "sigma_abs"):
+        if k in _c_params:
+            sigma_key_c = k
+            break
+    T_key_c = "T"
+    for k in ("T", "T_expiry"):
+        if k in _c_params:
+            T_key_c = k
+            break
+    r_key_c = "r"
+    for k in ("r", "r_d"):
+        if k in _c_params:
+            r_key_c = k
+            break
+
+    if any(k not in _c_params for k in (S_key_c, sigma_key_c, T_key_c)):
+        st.warning(
+            "CVA requires Spot, Volatility, and Time-to-Expiry parameters."
+        )
+        st.stop()
+
+    spot_c = float(_c_params[S_key_c])
+    sigma_c = float(_c_params[sigma_key_c])
+    T_c = float(_c_params[T_key_c])
+    r_c = float(_c_params.get(r_key_c, 0.05))
+
+    st.markdown('<div class="section-header">CVA Configuration</div>', unsafe_allow_html=True)
+
+    cva_c1, cva_c2, cva_c3, cva_c4 = st.columns(4)
+    with cva_c1:
+        cva_position = st.number_input(
+            "Position Size (contracts)", min_value=1.0, max_value=1e7,
+            value=100.0, step=10.0, key="cva_pos_size",
+        )
+    with cva_c2:
+        cva_long = st.radio(
+            "Direction", ["Long", "Short"], index=0,
+            horizontal=True, key="cva_long",
+            help="Long = we hold the option from counterparty (CVA applies)\n"
+                 "Short = we sold the option to counterparty (DVA applies)",
+        )
+        cva_is_long = (cva_long == "Long")
+    with cva_c3:
+        cva_disc = st.number_input(
+            "Discount Rate (r, %)", min_value=-5.0, max_value=20.0,
+            value=float(r_c) * 100, step=0.1, key="cva_disc",
+        ) / 100.0
+    with cva_c4:
+        cva_seed = st.number_input(
+            "MC Seed", min_value=0, max_value=99999,
+            value=42, step=1, key="cva_seed",
+        )
+
+    cva_d1, cva_d2, cva_d3 = st.columns(3)
+    with cva_d1:
+        cp_cds_bps = st.number_input(
+            "Counterparty CDS Spread (bps)", min_value=0.0, max_value=5000.0,
+            value=150.0, step=10.0, key="cva_cp_cds",
+            help="Counterparty's CDS spread — drives the hazard rate",
+        )
+    with cva_d2:
+        cp_recovery = st.number_input(
+            "Counterparty Recovery (%)", min_value=0.0, max_value=100.0,
+            value=40.0, step=5.0, key="cva_cp_rec",
+        ) / 100.0
+    with cva_d3:
+        own_cds_bps = st.number_input(
+            "Own CDS Spread (bps, for DVA)", min_value=0.0, max_value=5000.0,
+            value=0.0, step=10.0, key="cva_own_cds",
+            help="Set 0 to ignore DVA; otherwise institution's own CDS spread",
+        )
+
+    cva_e1, cva_e2 = st.columns(2)
+    with cva_e1:
+        n_paths_cva = st.selectbox(
+            "MC Paths", [500, 1000, 2000, 5000, 10000], index=2, key="cva_paths",
+        )
+    with cva_e2:
+        n_steps_cva = st.selectbox(
+            "Time Steps", [12, 24, 36, 52, 100], index=1, key="cva_steps",
+        )
+
+    run_cva = st.button(
+        "▶  Compute CVA", key="run_cva", type="primary", use_container_width=True,
+    )
+
+    if run_cva:
+        # Build pricer kwargs
+        int_keys = {"N", "N_S", "N_T", "n", "n_paths", "n_steps", "n_terms"}
+        cva_kw = dict(_c_params)
+        if _c_ot:
+            cva_kw["option_type"] = _c_ot
+        cva_kw.update(_c_ec)
+        cva_kw.update(_c_ep)
+        for k in int_keys:
+            if k in cva_kw:
+                cva_kw[k] = int(cva_kw[k])
+
+        cva_func = load_func(product["module"], product["func"])
+
+        with st.spinner(f"Simulating {n_paths_cva} paths × {n_steps_cva} steps..."):
+            try:
+                cva_result = compute_cva_for_option(
+                    pricer=cva_func,
+                    base_kwargs=cva_kw,
+                    spot_key=S_key_c,
+                    T_key=T_key_c,
+                    sigma_annual=sigma_c,
+                    discount_rate=cva_disc,
+                    counterparty_cds_bps=cp_cds_bps,
+                    counterparty_recovery=cp_recovery,
+                    own_cds_bps=own_cds_bps,
+                    own_recovery=0.40,
+                    is_long=cva_is_long,
+                    notional_multiplier=cva_position,
+                    n_paths=int(n_paths_cva),
+                    n_steps=int(n_steps_cva),
+                    seed=int(cva_seed),
+                )
+            except Exception as e:
+                st.error(f"CVA computation failed: {e}")
+                st.stop()
+
+        # ---- Results display ----
+        st.markdown('<div class="section-header">CVA Results</div>', unsafe_allow_html=True)
+
+        v0 = cva_result["v0"]
+        cva_v = cva_result["CVA"]
+        dva_v = cva_result["DVA"]
+        bcva_v = cva_result["BCVA"]
+        risky_p = cva_result["risky_price"]
+
+        # Position summary
+        st.markdown(
+            f"<div class='info-box'>"
+            f"<b>Position:</b> {cva_long} {cva_position:,.0f} contracts &nbsp;|&nbsp; "
+            f"<b>Risk-Free Value:</b> {v0:,.2f} &nbsp;|&nbsp; "
+            f"<b>Counterparty Hazard:</b> {cva_result['counterparty_hazard']*100:.2f}%/yr &nbsp;|&nbsp; "
+            f"<b>EPE:</b> {cva_result['EPE']:,.2f}"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.markdown(f"""
+            <div class="metric-card metric-card-red">
+                <h3>CVA (Cost)</h3>
+                <div class="value">{cva_v:,.2f}</div>
+            </div>""", unsafe_allow_html=True)
+            cva_pct = (cva_v / abs(v0) * 100) if v0 != 0 else 0
+            st.caption(f"{cva_pct:.2f}% of risk-free value")
+        with m2:
+            st.markdown(f"""
+            <div class="metric-card metric-card-green">
+                <h3>DVA (Benefit)</h3>
+                <div class="value">{dva_v:,.2f}</div>
+            </div>""", unsafe_allow_html=True)
+            st.caption("From own credit risk" if own_cds_bps > 0 else "Set Own CDS > 0")
+        with m3:
+            st.markdown(f"""
+            <div class="metric-card metric-card-blue">
+                <h3>Net BCVA</h3>
+                <div class="value">{bcva_v:+,.2f}</div>
+            </div>""", unsafe_allow_html=True)
+            st.caption("CVA − DVA")
+        with m4:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Risky Price</h3>
+                <div class="value">{risky_p:,.2f}</div>
+            </div>""", unsafe_allow_html=True)
+            st.caption(f"Risk-free − CVA + DVA")
+
+        st.markdown("")
+
+        # Exposure profile chart
+        st.markdown('<div class="section-header">Expected Exposure Profile</div>', unsafe_allow_html=True)
+        times_arr = cva_result["times"]
+        ee_arr = cva_result["EE_profile"]
+        pfe_arr = cva_result["PFE_profile"]
+
+        fig_ee = go.Figure()
+        fig_ee.add_trace(go.Scatter(
+            x=times_arr, y=pfe_arr, mode="lines",
+            name="PFE 97.5%",
+            line=dict(color="#e74c3c", width=2, dash="dash"),
+            fill="tonexty", fillcolor="rgba(231,76,60,0.08)",
+        ))
+        fig_ee.add_trace(go.Scatter(
+            x=times_arr, y=ee_arr, mode="lines",
+            name="Expected Exposure",
+            line=dict(color="#2980b9", width=2.5),
+            fill="tozeroy", fillcolor="rgba(41,128,185,0.15)",
+        ))
+        # EPE horizontal line
+        fig_ee.add_hline(
+            y=cva_result["EPE"],
+            line_dash="dot", line_color="#27ae60",
+            annotation_text=f"EPE = {cva_result['EPE']:,.2f}",
+            annotation_position="top right",
+        )
+        fig_ee.update_layout(
+            title="Expected Exposure & PFE over time",
+            xaxis_title="Time (years)",
+            yaxis_title="Exposure",
+            height=380,
+            template="plotly_white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(l=50, r=30, t=60, b=50),
+        )
+        st.plotly_chart(fig_ee, use_container_width=True)
+
+        # Comparison table
+        with st.expander("📋 Detailed Numbers", expanded=False):
+            import pandas as pd
+            rows = [
+                ["Risk-free value (V₀)",            f"{v0:,.4f}"],
+                ["Expected Positive Exposure (EPE)", f"{cva_result['EPE']:,.4f}"],
+                ["Peak EE",                          f"{float(np.max(ee_arr)):,.4f}"],
+                ["Peak PFE 97.5%",                   f"{float(np.max(pfe_arr)):,.4f}"],
+                ["CVA (cost)",                       f"{cva_v:,.4f}"],
+                ["DVA (benefit)",                    f"{dva_v:,.4f}"],
+                ["BCVA (net)",                       f"{bcva_v:+,.4f}"],
+                ["Risky price",                      f"{risky_p:,.4f}"],
+                ["Counterparty hazard rate",         f"{cva_result['counterparty_hazard']*100:.4f}% / year"],
+                ["Counterparty 1Y default prob",     f"{(1-np.exp(-cva_result['counterparty_hazard']))*100:.4f}%"],
+            ]
+            df = pd.DataFrame(rows, columns=["Metric", "Value"])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # Methodology
+        with st.expander("📖 Methodology"):
+            st.markdown("""
+**Credit Valuation Adjustment (CVA)** is the market value of counterparty credit risk:
+the expected loss arising from the counterparty defaulting before the option expires.
+
+**Workflow:**
+
+1. **Hazard rate** from CDS spread:  $h \\approx s_{CDS} / (1-R)$
+2. **Survival probability**:  $S(t) = e^{-h\\,t}$
+3. **Exposure simulation** — simulate underlying paths under risk-neutral GBM,
+   reprice the option on each path at each grid point.
+4. **EE(t)** = average option value across paths at time $t$.
+5. **CVA** = $LGD \\cdot \\sum_i D(t_i) \\cdot EE(t_i) \\cdot [S(t_{i-1}) - S(t_i)]$
+
+**For a long option holder (this position):**
+- We are exposed to counterparty default → CVA reduces the risky price.
+- ENE ≈ 0 (we never owe counterparty on a long vanilla option) → DVA = 0 unless own_cds > 0 reflects bilateral.
+
+**For a short option position:**
+- We owe counterparty → DVA applies (benefit from our own default risk).
+- CVA = 0 from our perspective.
+
+**BCVA (Bilateral CVA)** = CVA − DVA, the net adjustment.
+
+Reference: Jon Gregory, *Counterparty Credit Risk* (Wiley, 2010).
 """)
